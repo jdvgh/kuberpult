@@ -126,18 +126,33 @@ func GoogleIAPInterceptor(
 }
 
 func checkPolicy(httpCtx context.Context, w http.ResponseWriter, req *http.Request, userGroup string) context.Context {
-	policy, err := auth.ReadRbacPolicy(true, "/etc/policy.csv")
+	policy, err := auth.ReadRbacPolicy(true, "/kuberpult-rbac/policy.csv")
 	if err != nil {
+		logger.FromContext(req.Context()).Info(fmt.Sprintf("Error reading policy: %s", err))
 		http.Error(w, "unable to access RBAC policy to validate login", http.StatusBadRequest)
 		return nil
 	}
+	logger.FromContext(req.Context()).Info(fmt.Sprintf("Checking policy for group: %s", userGroup))
+	logger.FromContext(req.Context()).Info(fmt.Sprintf("Policy: %v", policy))
+	logger.FromContext(req.Context()).Info(fmt.Sprintf("Policy.Groups: %v", policy.Groups))
 	for _, policyGroup := range policy.Groups {
 		if policyGroup.Group == userGroup {
+			logger.FromContext(req.Context()).Info(fmt.Sprintf("Found policy for group: %s", userGroup))
 			auth.WriteUserRoleToHttpHeader(req, policyGroup.Role)
 			httpCtx = auth.WriteUserRoleToGrpcContext(req.Context(), policyGroup.Role)
+			logger.FromContext(req.Context()).Info(fmt.Sprintf("Wrote Role to contexts: %s", policyGroup.Role))
+			logger.FromContext(req.Context()).Info(fmt.Sprintf("New httpCtx : %v", httpCtx))
 		}
 	}
 	return httpCtx
+}
+
+type MyClaims struct {
+	Email    string   `json:"email"`
+	Verified bool     `json:"email_verified"`
+	Groups   []string `json:"groups"`
+	Audience string   `json:"aud"`
+	Subject  string   `json:"sub"`
 }
 
 // DexLoginInterceptor intercepts HTTP calls to the frontend service.
@@ -156,19 +171,30 @@ func DexLoginInterceptor(
 		// If user is not authenticated redirect to the login page.
 		http.Redirect(w, req, auth.LoginPATH, http.StatusFound)
 	}
-	var httpCtx context.Context
-
-	switch {
-	case len(claims["groups"].([]interface{})) > 0:
-		for _, group := range claims["groups"].([]interface{}) {
-			groupName := strings.Trim(group.(string), "\"")
-			httpCtx = checkPolicy(httpCtx, w, req, groupName)
+	httpCtx := req.Context()
+	groups, ok := claims["groups"].([]string)
+	if !ok {
+		logger.FromContext(req.Context()).Info(fmt.Sprintf("Error casting groups claim to []string - claims %v", claims))
+		groups = []string{}
+		groupsI, okI := claims["groups"].([]interface{})
+		if okI {
+			for _, groupI := range groupsI {
+				group, okI2 := groupI.(string)
+				if !okI2 {
+					group = fmt.Sprintf("%v", groupI)
+				}
+				groups = append(groups, group)
+			}
 		}
-	case claims["sub"].(string) != "":
-		httpCtx = checkPolicy(httpCtx, w, req, claims["sub"].(string))
-	default:
-		http.Error(w, "unable to parse token with expected fields for DEX login", http.StatusBadRequest)
-		return
+		if !okI {
+
+			logger.FromContext(req.Context()).Info(fmt.Sprint("Error casting groups claim to []interface {}"))
+		}
+	}
+	for _, group := range groups {
+		groupName := strings.Trim(group, "\"")
+		logger.FromContext(req.Context()).Info(fmt.Sprintf("Verifying  Group: %s", groupName))
+		httpCtx = checkPolicy(httpCtx, w, req, groupName)
 	}
 
 	httpCtx = context.WithValue(httpCtx, "claims", claims)
